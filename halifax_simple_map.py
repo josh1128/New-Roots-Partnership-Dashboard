@@ -1,15 +1,19 @@
-# halifax_chamber_map.py
-# Streamlit app: scrape Halifax Chamber "Not-For-Profit/Charitable" list,
-# parse addresses, geocode, and map nonprofits in Halifax.
+# halifax_chamber_map_dots.py
+# Streamlit app: scrape Halifax Chamber Not-For-Profit directory, geocode, and show
+# BIG, VISIBLE DOTS on a Halifax map with tooltips.
 #
 # Run:
 #   pip install -r requirements.txt
-#   streamlit run halifax_chamber_map.py
+#   streamlit run halifax_chamber_map_dots.py
 #
-# Notes:
-# - Uses Halifax Chamber directory page as the data source.
-# - Respects geocoding rate limit (1 req/sec) and caches results.
-# - Best for personal/operational use. If republishing, review Chamber terms.
+# requirements.txt (minimum):
+#   streamlit>=1.32
+#   pandas>=2.0
+#   pydeck>=0.9
+#   beautifulsoup4>=4.12
+#   lxml>=4.9
+#   requests>=2.32
+#   geopy>=2.4
 
 from __future__ import annotations
 import re
@@ -25,16 +29,36 @@ import pydeck as pdk
 from geopy.geocoders import Nominatim
 from geopy.extra.rate_limiter import RateLimiter
 
-st.set_page_config(page_title="Halifax Nonprofits — Chamber Directory Map", layout="wide")
-st.title("Halifax Nonprofits — Chamber Directory Map")
+st.set_page_config(page_title="Halifax Nonprofits — Chamber Directory (Dots)", layout="wide")
+st.title("Halifax Nonprofits — Chamber Directory (Dots Map)")
 
 CATEGORY_URL = "https://business.halifaxchamber.com/members/category/not-for-profit-groups-charitable-organizations-87"
-SHEET_NAME = "nonprofits"  # internal only if you export
-CACHE_FILE = Path("data/geocode_cache.csv")  # persisted cache (best effort)
+CACHE_FILE = Path("data/geocode_cache.csv")  # persisted cache if filesystem is writable
 
-# Halifax bounds (sanity checks)
+# Halifax sanity bounds
 HAL_LAT = (44.3, 45.1)
 HAL_LON = (-64.2, -62.9)
+
+# ------------------ Sidebar dot styling ------------------ #
+with st.sidebar:
+    st.header("Dot style")
+    radius_px = st.slider("Dot radius (pixels)", 40, 220, 120, 5)
+    opacity_pct = st.slider("Opacity (%)", 20, 100, 90, 5)
+    color_name = st.selectbox(
+        "Dot color",
+        ["Electric Blue", "Orange Red", "Emerald", "Purple", "Charcoal"],
+        index=0
+    )
+
+COLOR_MAP = {
+    "Electric Blue": (0, 153, 255),
+    "Orange Red": (255, 69, 0),
+    "Emerald": (0, 178, 120),
+    "Purple": (138, 43, 226),
+    "Charcoal": (40, 40, 40),
+}
+RGB = COLOR_MAP[color_name]
+ALPHA = int(round(opacity_pct / 100 * 255))
 
 # ------------------ Scrape helpers ------------------ #
 def get_soup(url: str) -> BeautifulSoup:
@@ -43,27 +67,17 @@ def get_soup(url: str) -> BeautifulSoup:
     return BeautifulSoup(resp.text, "lxml")
 
 def parse_listing_page(url: str) -> list[dict]:
-    """
-    Return list of {name, detail_url} from the category page.
-    The page shows 'Results Found: N' and lists member cards with links.
-    """
+    """Return list of {name, detail_url} from the category page."""
     soup = get_soup(url)
     items: list[dict] = []
-    # Strategy: find all links to /members/member/...
     for a in soup.find_all("a", href=True):
         href = a["href"]
         if "/members/member/" in href:
-            # filter duplicates via name anchor text
             name = a.get_text(strip=True)
-            if not name:
-                continue
-            # Avoid collecting "Visit Website" etc. Restrict: anchor inside H5 or strong-ish headings.
-            parent_tag = a.find_parent()
-            # Keep simple: accept unique (name, href) pairs
-            items.append({"name": name, "detail_url": requests.compat.urljoin(url, href)})
-    # De-dup by detail_url
-    seen = set()
-    uniq = []
+            if name:
+                items.append({"name": name, "detail_url": requests.compat.urljoin(url, href)})
+    # de-dup by detail_url
+    seen, uniq = set(), []
     for it in items:
         if it["detail_url"] in seen:
             continue
@@ -71,43 +85,31 @@ def parse_listing_page(url: str) -> list[dict]:
         uniq.append(it)
     return uniq
 
-def text_or_none(el) -> str:
+def txt(el) -> str:
     return el.get_text(" ", strip=True) if el else ""
 
 def parse_member_detail(url: str) -> dict:
-    """
-    From a member detail page, parse:
-      - name (H1)
-      - address (first 'maps/google' link text or nearby text)
-      - website (anchor containing 'Visit Website')
-      - phone(s) (naive regex over page text)
-      - about/description (optional)
-    """
+    """Grab org_name, address, website, phone, about from a member page."""
     soup = get_soup(url)
+    name = txt(soup.find(["h1", "h2"])) or ""
 
-    # Name
-    h1 = soup.find(["h1", "h2"])
-    name = text_or_none(h1) or ""
-
-    # Address: often appears as an <a> with href to Google
+    # Address: often a link pointing to Google Maps
     addr = ""
     for a in soup.find_all("a", href=True):
         if "google." in a["href"]:
-            candidate = a.get_text(" ", strip=True)
-            # Basic sanity: must include NS (Nova Scotia) or Halifax/Dartmouth
-            if "NS" in candidate or "Halifax" in candidate or "Dartmouth" in candidate or "Bedford" in candidate:
-                addr = candidate
+            cand = a.get_text(" ", strip=True)
+            if any(k in cand for k in ["NS", "Halifax", "Dartmouth", "Bedford"]):
+                addr = cand
                 break
 
-    # Website: link with text containing "Visit Website"
+    # Website
     website = ""
     for a in soup.find_all("a", href=True):
-        label = a.get_text(" ", strip=True).lower()
-        if "visit website" in label:
+        if "visit website" in a.get_text(" ", strip=True).lower():
             website = a["href"]
             break
 
-    # Phone(s): simple regex over full text
+    # Phones (simple regex)
     page_text = soup.get_text(" ", strip=True)
     phones = re.findall(r"\(?\d{3}\)?[-.\s]?\d{3}[-.\s]?\d{4}", page_text)
     phone = ", ".join(sorted(set(phones)))[:80]
@@ -116,25 +118,23 @@ def parse_member_detail(url: str) -> dict:
     about = ""
     about_hdr = soup.find(lambda t: t.name in ["h2", "h3"] and "about" in t.get_text(strip=True).lower())
     if about_hdr:
-        # grab next sibling text block
-        sib = about_hdr.find_next()
-        about = text_or_none(sib)
+        nxt = about_hdr.find_next()
+        about = txt(nxt)
 
     return {"org_name": name, "address": addr, "website": website, "phone": phone, "about": about, "detail_url": url}
 
-# ------------------ Geocoding ------------------ #
+# ------------------ Geocoding (cached) ------------------ #
 @st.cache_data
 def load_cache() -> pd.DataFrame:
     if CACHE_FILE.exists():
         try:
-            df = pd.read_csv(CACHE_FILE)
-            if not {"address", "lat", "lon"}.issubset(df.columns):
-                return pd.DataFrame(columns=["address", "lat", "lon"])
-            df["address_norm"] = df["address"].astype(str).str.strip().str.lower()
-            return df
+            c = pd.read_csv(CACHE_FILE)
+            if {"address", "lat", "lon"}.issubset(c.columns):
+                c["address_norm"] = c["address"].astype(str).str.strip().str.lower()
+                return c
         except Exception:
-            return pd.DataFrame(columns=["address", "lat", "lon"])
-    return pd.DataFrame(columns=["address", "lat", "lon"])
+            pass
+    return pd.DataFrame(columns=["address", "lat", "lon", "address_norm"])
 
 def save_cache(cache_df: pd.DataFrame):
     try:
@@ -144,27 +144,26 @@ def save_cache(cache_df: pd.DataFrame):
         pass
 
 @st.cache_data(show_spinner=False)
-def geocode_addresses(addresses: tuple[str, ...]) -> dict[str, Tuple[Optional[float], Optional[float]]]:
-    geocoder = Nominatim(user_agent="halifax_nonprofits_map")
+def geocode_batch(addresses: tuple[str, ...]) -> dict[str, tuple[float | None, float | None]]:
+    geocoder = Nominatim(user_agent="halifax_nonprofits_map_dots")
     geocode = RateLimiter(geocoder.geocode, min_delay_seconds=1, swallow_exceptions=True)
-    out: dict[str, Tuple[Optional[float], Optional[float]]] = {}
-    for raw in addresses:
-        q = f"{raw}, Halifax Regional Municipality, Nova Scotia, Canada"
+    results: dict[str, tuple[float | None, float | None]] = {}
+    for addr in addresses:
+        q = f"{addr}, Halifax Regional Municipality, Nova Scotia, Canada"
         loc = geocode(q)
         if loc:
-            out[raw] = (loc.latitude, loc.longitude)
+            results[addr] = (loc.latitude, loc.longitude)
         else:
-            out[raw] = (None, None)
-    return out
+            results[addr] = (None, None)
+    return results
 
-def fill_missing_coords(df: pd.DataFrame) -> tuple[pd.DataFrame, list[str]]:
+def fill_coords(df: pd.DataFrame) -> tuple[pd.DataFrame, list[str]]:
     msgs = []
     cache = load_cache().copy()
     if "address_norm" not in cache.columns:
         cache["address_norm"] = cache["address"].astype(str).str.strip().str.lower()
 
     df["address_norm"] = df["address"].astype(str).str.strip().str.lower()
-    # merge cached coords
     df = df.merge(cache[["address_norm", "lat", "lon"]].rename(columns={"lat": "lat_cached", "lon": "lon_cached"}),
                   on="address_norm", how="left")
     if "lat" not in df.columns: df["lat"] = None
@@ -175,14 +174,17 @@ def fill_missing_coords(df: pd.DataFrame) -> tuple[pd.DataFrame, list[str]]:
     todo = df[df["lat"].isna() | df["lon"].isna()]["address"].dropna().unique().tolist()
     if todo:
         st.info(f"Geocoding {len(todo)} address(es)… (OpenStreetMap, 1 req/sec)")
-        lookups = geocode_addresses(tuple(todo))
-        # apply back + upsert cache
+        lookups = geocode_batch(tuple(todo))
         for addr in todo:
             lat, lon = lookups.get(addr, (None, None))
             if lat is not None and lon is not None:
-                df.loc[df["address"] == addr, "lat"] = lat
-                df.loc[df["address"] == addr, "lon"] = lon
-                row = {"address": addr, "lat": lat, "lon": lon, "address_norm": addr.strip().lower()}
+                df.loc[df["address"] == addr, ["lat", "lon"]] = (lat, lon)
+                row = {
+                    "address": addr,
+                    "lat": lat,
+                    "lon": lon,
+                    "address_norm": addr.strip().lower()
+                }
                 cache = pd.concat([cache[cache["address_norm"] != row["address_norm"]], pd.DataFrame([row])],
                                   ignore_index=True)
         save_cache(cache)
@@ -192,36 +194,28 @@ def fill_missing_coords(df: pd.DataFrame) -> tuple[pd.DataFrame, list[str]]:
     df.drop(columns=[c for c in ["lat_cached", "lon_cached", "address_norm"] if c in df.columns], inplace=True)
     return df, msgs
 
-# ------------------ Scrape + assemble ------------------ #
+# ------------------ Build dataset ------------------ #
 @st.cache_data
 def build_directory_dataframe(url: str) -> pd.DataFrame:
     listing = parse_listing_page(url)
-
-    # De-dup by detail URL
+    # visit each detail page
+    rows = []
     seen = set()
-    to_visit = []
-    for item in listing:
+    for i, item in enumerate(listing, 1):
         href = item["detail_url"]
         if href in seen:
             continue
         seen.add(href)
-        to_visit.append(href)
-
-    rows = []
-    # Visit each member page; be polite to the site (short sleep)
-    for i, href in enumerate(to_visit, 1):
         try:
             detail = parse_member_detail(href)
-            # fallback to listing name if detail missing name
             if not detail.get("org_name"):
-                detail["org_name"] = next((x["name"] for x in listing if x["detail_url"] == href), "")
+                detail["org_name"] = item["name"]
             rows.append(detail)
         except Exception as e:
-            rows.append({"org_name": "", "address": "", "website": "", "phone": "", "about": "", "detail_url": href, "error": str(e)})
-        time.sleep(0.2)  # light throttle
-
+            rows.append({"org_name": item["name"], "address": "", "website": "", "phone": "", "about": "", "detail_url": href, "error": str(e)})
+        time.sleep(0.2)  # be polite to the site
     df = pd.DataFrame(rows)
-    # Derive area (very rough) from address text
+    # naive area from address
     def infer_area(addr: str) -> str:
         a = (addr or "").lower()
         if "dartmouth" in a: return "Dartmouth"
@@ -231,38 +225,31 @@ def build_directory_dataframe(url: str) -> pd.DataFrame:
     df["area"] = df["address"].apply(infer_area)
     return df
 
-with st.spinner("Fetching Chamber directory…"):
+with st.spinner("Fetching Halifax Chamber directory…"):
     df = build_directory_dataframe(CATEGORY_URL)
 
-# Clean + geocode
-keep_cols = ["org_name", "area", "address", "website", "phone", "about", "detail_url"]
-df = df[keep_cols].copy()
-df, geo_msgs = fill_missing_coords(df)
+keep = ["org_name", "area", "address", "website", "phone", "about", "detail_url"]
+df = df[keep].copy()
+df, geocode_msgs = fill_coords(df)
 
-# Filter out anything wildly outside Halifax (sanity)
+# sanity: outside Halifax bounds
 oob = (~df["lat"].between(*HAL_LAT) | ~df["lon"].between(*HAL_LON))
 oob_count = int(oob.sum())
-if oob_count:
-    st.warning(f"{oob_count} location(s) outside typical Halifax bounds (may be PO boxes or province-wide). They remain on map.")
+pins = df.dropna(subset=["lat", "lon"]).copy()
 
-# Report + preview
-pins = df.dropna(subset=["lat", "lon"])
-st.success(f"Loaded nonprofits: {len(df)} · Mappable pins: {len(pins)}")
-for m in geo_msgs:
+st.success(f"Loaded nonprofits: {len(df)} · Mappable dots: {len(pins)}")
+for m in geocode_msgs:
     st.info(m)
+if oob_count:
+    st.warning(f"{oob_count} location(s) outside typical Halifax bounds (may be PO boxes / province-wide).")
 
 with st.expander("Preview data"):
     st.dataframe(df.sort_values("org_name").reset_index(drop=True), use_container_width=True)
 
-# Optional: export to CSV for reuse
-col1, col2 = st.columns(2)
-with col1:
-    st.download_button("Download CSV (for your repo/app)", pins[["org_name","area","address","lat","lon","website","phone","about","detail_url"]].to_csv(index=False),
-                       file_name="halifax_nonprofits_from_chamber.csv", mime="text/csv")
-
-# ------------------ Map ------------------ #
+# ------------------ Map (visible dots) ------------------ #
 def compute_view(d: pd.DataFrame) -> pdk.ViewState:
-    if d.empty: return pdk.ViewState(latitude=44.6488, longitude=-63.5752, zoom=11, pitch=0)
+    if d.empty:
+        return pdk.ViewState(latitude=44.6488, longitude=-63.5752, zoom=11, pitch=0)
     return pdk.ViewState(latitude=float(d["lat"].mean()), longitude=float(d["lon"].mean()), zoom=11, pitch=0)
 
 tooltip = {
@@ -276,16 +263,22 @@ tooltip = {
     "style": {"backgroundColor": "white", "color": "black"},
 }
 
-layer = pdk.Layer(
+dot_color = [RGB[0], RGB[1], RGB[2], ALPHA]
+
+dots = pdk.Layer(
     "ScatterplotLayer",
     data=pins,
     get_position='[lon, lat]',
-    get_radius=100,
+    get_radius=radius_px,       # BIG, visible dots
+    filled=True,
+    stroked=False,              # no thin outlines
+    get_fill_color=dot_color,   # constant color with chosen opacity
     pickable=True,
     auto_highlight=True,
 )
 
-deck = pdk.Deck(layers=[layer], initial_view_state=compute_view(pins), tooltip=tooltip)
+deck = pdk.Deck(layers=[dots], initial_view_state=compute_view(pins), tooltip=tooltip)
 st.pydeck_chart(deck, use_container_width=True)
 
-st.caption("Data source: Halifax Chamber member directory (Not-For-Profit/Charitable). Use responsibly for outreach; verify details before contact.")
+st.caption("Dots are sized for visibility. Adjust size/opacity/color in the sidebar.")
+
