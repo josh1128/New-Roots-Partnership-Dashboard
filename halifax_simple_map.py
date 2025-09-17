@@ -1,60 +1,55 @@
-# halifax_map_from_repo_fixed.py
-# Streamlit app that AUTO-LOADS an Excel file from your GitHub repo and
-# shows Halifax non-profits on a map with robust fixes for common data issues.
+# halifax_map_from_repo_geocode.py
+# Streamlit app that loads an Excel/CSV from your GitHub repo and shows a Halifax map.
+# You can provide ONLY "address" (plus org_name, services). If lat/lon are missing,
+# the app GEOCODES the address to coordinates (cached) and plots the pins.
 #
-# Put your Excel in the repo at ONE of these paths:
-#   data/halifax_nonprofits_map.xlsx   (recommended)
-#   halifax_nonprofits_map.xlsx        (root fallback)
-# The sheet must be named: "nonprofits"
+# Put your data file in the repo at ONE of these paths:
+#   data/halifax_nonprofits_map.xlsx   (sheet "nonprofits")
+#   halifax_nonprofits_map.xlsx        (sheet "nonprofits")
+#   data/nonprofits.csv                (CSV)
+#   nonprofits.csv                     (CSV)
 #
-# Required columns (case-insensitive; aliases handled): 
-#   org_name, address, services, lat(or latitude), lon(long/longitude)
+# Required columns (case-insensitive; aliases handled):
+#   org_name, address, services
 # Optional columns:
-#   area, website, phone, notes
+#   lat (or latitude), lon (or long/longitude), area, website, phone, notes
 #
 # Run locally:
-#   pip install streamlit pandas pydeck openpyxl
-#   streamlit run halifax_map_from_repo_fixed.py
+#   pip install streamlit pandas pydeck openpyxl geopy
+#   streamlit run halifax_map_from_repo_geocode.py
 #
 # requirements.txt:
 #   streamlit>=1.32
 #   pandas>=2.0
 #   pydeck>=0.9
 #   openpyxl>=3.1
+#   geopy>=2.4
 
 from __future__ import annotations
+import time
 from pathlib import Path
-import math
 import streamlit as st
 import pandas as pd
 import pydeck as pdk
+from geopy.geocoders import Nominatim
+from geopy.extra.rate_limiter import RateLimiter
 
-st.set_page_config(page_title="Halifax Non-Profits — Map (repo Excel, fixed)", layout="wide")
-st.title("Halifax Non-Profits — Map (auto-load from repo, with fixes)")
+st.set_page_config(page_title="Halifax Non-Profits — Map (address-only OK)", layout="wide")
+st.title("Halifax Non-Profits — Map")
+st.caption("You can list only **address** (plus name & services). The app geocodes missing coordinates automatically (cached).")
 
 # -------------------------- Config -------------------------- #
-DATA_PATHS = [
-    Path("data/halifax_nonprofits_map.xlsx"),  # recommended
-    Path("halifax_nonprofits_map.xlsx"),       # root fallback
-]
+DATA_PATHS_XLSX = [Path("data/halifax_nonprofits_map.xlsx"), Path("halifax_nonprofits_map.xlsx")]
+DATA_PATHS_CSV  = [Path("data/nonprofits.csv"), Path("nonprofits.csv")]
 SHEET_NAME = "nonprofits"
 
-# Halifax rough bounds (for sanity checks)
 HALIFAX_LAT_RANGE = (44.3, 45.1)
 HALIFAX_LON_RANGE = (-64.2, -62.9)
 
-# ---------------------- Helper functions -------------------- #
-@st.cache_data
-def load_repo_excel(paths: list[Path], sheet_name: str) -> tuple[pd.DataFrame | None, str | None]:
-    """Return (df, src_path_str) if found, else (None, None)."""
-    for p in paths:
-        if p.exists():
-            df = pd.read_excel(p, sheet_name=sheet_name, engine="openpyxl")
-            return df, str(p)
-    return None, None
+CACHE_PATH = Path("data/geocode_cache.csv")  # optional on-disk cache (if repo is writeable at runtime)
 
-def normalize_columns(df: pd.DataFrame) -> pd.DataFrame:
-    """Standardize headers and provide aliases."""
+# ---------------------- Helpers ----------------------------- #
+def _normalize_columns(df: pd.DataFrame) -> pd.DataFrame:
     df = df.copy()
     df.columns = [c.strip().lower().replace(" ", "_") for c in df.columns]
     alias = {
@@ -65,87 +60,130 @@ def normalize_columns(df: pd.DataFrame) -> pd.DataFrame:
         "long": "lon",
         "longitude": "lon",
     }
-    df.rename(columns={c: alias.get(c, c) for c in df.columns}, inplace=True)
-
-    # Ensure optional columns exist for tooltips
+    df.rename(columns={c: alias.get(c, c) for c in df.columns], inplace=True)
     for opt in ["website", "phone", "area", "notes"]:
         if opt not in df.columns:
             df[opt] = ""
-
-    required = ["org_name", "address", "services"]
-    missing = [c for c in required if c not in df.columns]
-    if missing:
-        raise ValueError(f"Missing required columns: {', '.join(missing)}")
-
-    # Coerce coords if present
-    if "lat" in df.columns:
-        df["lat"] = pd.to_numeric(df["lat"], errors="coerce")
-    if "lon" in df.columns:
-        df["lon"] = pd.to_numeric(df["lon"], errors="coerce")
+    # required
+    for col in ["org_name", "address", "services"]:
+        if col not in df.columns:
+            raise ValueError(f"Missing required column: {col}")
+    # coerce coords if present
+    if "lat" in df.columns: df["lat"] = pd.to_numeric(df["lat"], errors="coerce")
+    if "lon" in df.columns: df["lon"] = pd.to_numeric(df["lon"], errors="coerce")
     return df
 
-def fix_common_coord_issues(df: pd.DataFrame) -> tuple[pd.DataFrame, list[str]]:
-    """Fix: swapped columns, positive lon sign, strings; returns (df, warnings)."""
+@st.cache_data
+def _load_repo_data() -> tuple[pd.DataFrame | None, str]:
+    # Try Excel then CSV
+    for p in DATA_PATHS_XLSX:
+        if p.exists():
+            df = pd.read_excel(p, sheet_name=SHEET_NAME, engine="openpyxl")
+            return df, str(p)
+    for p in DATA_PATHS_CSV:
+        if p.exists():
+            df = pd.read_csv(p)
+            return df, str(p)
+    return None, ""
+
+@st.cache_data
+def _load_cache() -> pd.DataFrame:
+    if CACHE_PATH.exists():
+        try:
+            c = pd.read_csv(CACHE_PATH)
+            if not {"address","lat","lon"}.issubset({*c.columns}):
+                return pd.DataFrame(columns=["address","lat","lon"])
+            c["lat"] = pd.to_numeric(c["lat"], errors="coerce")
+            c["lon"] = pd.to_numeric(c["lon"], errors="coerce")
+            c["address_norm"] = c["address"].str.strip().str.lower()
+            return c
+        except Exception:
+            return pd.DataFrame(columns=["address","lat","lon"])
+    return pd.DataFrame(columns=["address","lat","lon"])
+
+def _save_cache(cache_df: pd.DataFrame):
+    # Best-effort; may fail on some hosts with read-only FS
+    try:
+        CACHE_PATH.parent.mkdir(parents=True, exist_ok=True)
+        cache_df.to_csv(CACHE_PATH, index=False)
+    except Exception:
+        pass
+
+def _norm_addr(s: str) -> str:
+    return (s or "").strip().lower()
+
+@st.cache_data(show_spinner=False)
+def _geocode_addresses(addresses: tuple[str, ...]) -> dict[str, tuple[float | None, float | None]]:
+    """
+    Geocode a tuple of addresses using Nominatim with rate limit.
+    Returns dict: normalized_address -> (lat, lon)
+    Results cached by Streamlit across reruns.
+    """
+    geocoder = Nominatim(user_agent="new_roots_halifax_map")
+    geocode = RateLimiter(geocoder.geocode, min_delay_seconds=1, swallow_exceptions=True)  # be polite!
+
+    results: dict[str, tuple[float | None, float | None]] = {}
+    for addr in addresses:
+        a = _norm_addr(addr)
+        loc = geocode(f"{addr}, Halifax, Nova Scotia, Canada")
+        if loc:
+            results[a] = (loc.latitude, loc.longitude)
+        else:
+            results[a] = (None, None)
+    return results
+
+def geocode_missing(df: pd.DataFrame, cache_df: pd.DataFrame) -> tuple[pd.DataFrame, list[str]]:
+    """Fill lat/lon for rows missing coords by geocoding address; merge with cache; return df and messages."""
     msgs = []
-    if not {"lat", "lon"}.issubset(df.columns):
-        raise ValueError("Columns for coordinates not found. Add columns 'lat' and 'lon' (aliases ok).")
+    # Prepare cache
+    cache = cache_df.copy()
+    if "address_norm" not in cache.columns:
+        cache["address_norm"] = cache["address"].astype(str).str.strip().str.lower()
 
-    # Detect if lat/lon are swapped (many lats near -63 and lons near +44)
-    s_lat = df["lat"].dropna()
-    s_lon = df["lon"].dropna()
-    if not s_lat.empty and not s_lon.empty:
-        lat_mean = s_lat.mean()
-        lon_mean = s_lon.mean()
-        if (lat_mean < -60 and -70 < lon_mean < -40) or (44 <= lon_mean <= 46 and -70 <= lat_mean <= -60):
-            # almost certainly swapped (lat looks like -63, lon looks like 44-46)
-            df[["lat", "lon"]] = df[["lon", "lat"]]
-            msgs.append("Detected swapped lat/lon columns — auto-corrected.")
+    df["address_norm"] = df["address"].astype(str).str.strip().str.lower()
 
-    # Enforce Halifax sign: lon should be negative (~ -63.x)
-    if (df["lon"] > 0).sum() > 0:
-        # If values look like +63.x, flip to negative
-        suspect = df["lon"].between(60, 70).sum()
-        if suspect > 0:
-            df.loc[df["lon"].between(0, 180), "lon"] = -df.loc[df["lon"].between(0, 180), "lon"].abs()
-            msgs.append("Found positive longitudes ~+63 — converted to negative (Halifax).")
+    # Use cached hits first
+    df = df.merge(cache[["address_norm","lat","lon"]].rename(columns={"lat":"lat_cached","lon":"lon_cached"}),
+                  on="address_norm", how="left")
+    df["lat"] = df.get("lat", pd.Series([None]*len(df)))
+    df["lon"] = df.get("lon", pd.Series([None]*len(df)))
+    df["lat"] = df["lat"].fillna(df["lat_cached"])
+    df["lon"] = df["lon"].fillna(df["lon_cached"])
 
-    # Drop rows with missing/NaN coords
-    before = len(df)
-    df = df.dropna(subset=["lat", "lon"]).copy()
-    after = len(df)
-    if after < before:
-        msgs.append(f"Dropped {before - after} rows without valid lat/lon.")
+    # Collect addresses still missing
+    todo = df[df["lat"].isna() | df["lon"].isna()]["address"].dropna().unique().tolist()
+    if todo:
+        st.info(f"Geocoding {len(todo)} address(es)… (uses OpenStreetMap Nominatim; 1 req/sec)")
+        # Call geocoder (cached per unique address set)
+        lookups = _geocode_addresses(tuple(todo))
+        # Apply back
+        for addr in todo:
+            a = _norm_addr(addr)
+            lat, lon = lookups.get(a, (None, None))
+            if lat is not None and lon is not None:
+                df.loc[df["address_norm"] == a, "lat"] = lat
+                df.loc[df["address_norm"] == a, "lon"] = lon
+                # upsert to cache
+                cache_row = {"address": addr, "lat": lat, "lon": lon, "address_norm": a}
+                cache = pd.concat([cache[~(cache["address_norm"] == a)], pd.DataFrame([cache_row])], ignore_index=True)
+        _save_cache(cache)
+        msgs.append(f"Geocoded {sum([1 for a in todo if lookups.get(_norm_addr(a), (None, None))[0] is not None])} / {len(todo)} new address(es).")
 
-    # Warn about points outside rough Halifax bounds
-    out_of_bounds = (~df["lat"].between(*HALIFAX_LAT_RANGE) | ~df["lon"].between(*HALIFAX_LON_RANGE)).sum()
-    if out_of_bounds > 0:
-        msgs.append(f"{out_of_bounds} row(s) have coords outside Halifax bounds; they may be off-screen.")
-
+    # Clean up
+    df.drop(columns=[c for c in ["lat_cached","lon_cached","address_norm"] if c in df.columns], inplace=True)
     return df, msgs
 
 def compute_view(df: pd.DataFrame) -> pdk.ViewState:
-    """Center map on data; fallback to Halifax downtown if empty."""
     if df.empty or df["lat"].isna().all() or df["lon"].isna().all():
         return pdk.ViewState(latitude=44.6488, longitude=-63.5752, zoom=11, pitch=0)
-
-    c_lat = float(df["lat"].mean())
-    c_lon = float(df["lon"].mean())
-
-    # Choose zoom based on spatial spread (simple heuristic)
-    # compute rough spread in km using naive degree distances
-    lat_span = df["lat"].max() - df["lat"].min()
-    lon_span = df["lon"].max() - df["lon"].min()
+    c_lat, c_lon = float(df["lat"].mean()), float(df["lon"].mean())
+    lat_span = (df["lat"].max() - df["lat"].min()) if not df["lat"].isna().all() else 0
+    lon_span = (df["lon"].max() - df["lon"].min()) if not df["lon"].isna().all() else 0
     span = max(abs(lat_span), abs(lon_span))
-
-    if span > 0.5:
-        zoom = 9   # very spread out
-    elif span > 0.2:
-        zoom = 10
-    elif span > 0.08:
-        zoom = 11
-    else:
-        zoom = 12  # tight cluster
-
+    if span > 0.5:   zoom = 9
+    elif span > 0.2: zoom = 10
+    elif span > 0.08:zoom = 11
+    else:            zoom = 12
     return pdk.ViewState(latitude=c_lat, longitude=c_lon, zoom=zoom, pitch=0)
 
 def tooltip_template() -> dict:
@@ -160,59 +198,59 @@ def tooltip_template() -> dict:
         "style": {"backgroundColor": "white", "color": "black"},
     }
 
-# ------------------------ Load and prepare ------------------- #
-df_raw, src = load_repo_excel(DATA_PATHS, SHEET_NAME)
-if df_raw is None:
+# ---------------------- Load data ---------------------------- #
+raw, source = _load_repo_data()
+if raw is None:
     st.error(
-        "Could not find the Excel file in the repo.\n\n"
-        "Place it at **data/halifax_nonprofits_map.xlsx** (sheet: **nonprofits**), "
-        "or at repo root as **halifax_nonprofits_map.xlsx**."
+        "No data file found.\n\n"
+        "Add **data/halifax_nonprofits_map.xlsx** (sheet: 'nonprofits') OR **data/nonprofits.csv** "
+        "to this repo (or use the root equivalents)."
     )
     st.stop()
 
 try:
-    df = normalize_columns(df_raw)
+    df = _normalize_columns(raw)
 except Exception as e:
     st.error(str(e))
-    st.write("Detected columns:", list(df_raw.columns))
+    st.write("Detected columns:", list(raw.columns))
     st.stop()
 
-try:
-    df, fix_msgs = fix_common_coord_issues(df)
-except Exception as e:
-    st.error(str(e))
-    st.write("Detected columns after normalization:", list(df.columns))
-    st.stop()
+# Geocode if needed
+cache_df = _load_cache()
+df, geocode_msgs = geocode_missing(df, cache_df)
 
-st.success(f"Loaded from: **{src}** · Pins available: **{len(df)}**")
-for m in fix_msgs:
+# Keep only rows with coordinates after geocoding
+before = len(df)
+df = df.dropna(subset=["lat","lon"]).copy()
+after = len(df)
+
+st.success(f"Loaded from: **{source}** · Pins rendered: **{after}** (dropped {before - after} without coords)")
+for m in geocode_msgs:
     st.info(m)
 
-with st.expander("Preview (first 25 rows)"):
+# Bound warnings
+oob = (~df["lat"].between(*HALIFAX_LAT_RANGE) | ~df["lon"].between(*HALIFAX_LON_RANGE)).sum()
+if oob > 0:
+    st.warning(f"{oob} row(s) fall outside typical Halifax bounds. Check addresses or province.")
+
+with st.expander("Preview first 25 rows"):
     st.dataframe(df.head(25), use_container_width=True)
 
-# ----------------------------- Map --------------------------- #
+# ------------------------- Map ------------------------------- #
 view = compute_view(df)
-
 pins = pdk.Layer(
     "ScatterplotLayer",
     data=df,
     get_position='[lon, lat]',
-    get_radius=100,           # bigger pins to make sure you see them
+    get_radius=110,
     pickable=True,
     auto_highlight=True,
 )
-
-deck = pdk.Deck(
-    layers=[pins],
-    initial_view_state=view,
-    tooltip=tooltip_template(),
-    # leave default map_style so no Mapbox token required
-)
-
+deck = pdk.Deck(layers=[pins], initial_view_state=view, tooltip=tooltip_template())
 st.pydeck_chart(deck, use_container_width=True)
 
 st.caption(
-    "If pins still don’t appear: open the Preview to check coordinates. "
-    "Halifax should be roughly **lat≈44.6**, **lon≈-63.6**. Positive longitudes will be auto-flipped."
+    "To add organizations: edit your Excel/CSV (at the paths listed above). "
+    "You may leave `lat`/`lon` blank—addresses will be geocoded and cached automatically. "
+    "Powered by OpenStreetMap Nominatim (polite 1 req/sec)."
 )
