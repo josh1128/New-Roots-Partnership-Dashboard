@@ -1,184 +1,99 @@
-# halifax_map_from_repo_geocode.py
-# Streamlit app that loads an Excel/CSV from your GitHub repo and shows a Halifax map.
-# You can provide ONLY "address" (plus org_name, services). If lat/lon are missing,
-# the app GEOCODES the address to coordinates (cached) and plots the pins.
+# halifax_heatmap.py
+# Streamlit app: SIMPLE geographic heatmaps for Halifax non-profit activity.
+# No Excel needed. Uses built-in sample points OR paste-your-own coordinates.
 #
-# Put your data file in the repo at ONE of these paths:
-#   data/halifax_nonprofits_map.xlsx   (sheet "nonprofits")
-#   halifax_nonprofits_map.xlsx        (sheet "nonprofits")
-#   data/nonprofits.csv                (CSV)
-#   nonprofits.csv                     (CSV)
+# Run:
+#   pip install streamlit pandas pydeck
+#   streamlit run halifax_heatmap.py
 #
-# Required columns (case-insensitive; aliases handled):
-#   org_name, address, services
-# Optional columns:
-#   lat (or latitude), lon (or long/longitude), area, website, phone, notes
-#
-# Run locally:
-#   pip install streamlit pandas pydeck openpyxl geopy
-#   streamlit run halifax_map_from_repo_geocode.py
-#
-# requirements.txt:
-#   streamlit>=1.32
-#   pandas>=2.0
-#   pydeck>=0.9
-#   openpyxl>=3.1
-#   geopy>=2.4
+# Paste data format (no header, one per line):
+#   lat,lon,weight
+# Example:
+#   44.6590,-63.5895,3
 
-from __future__ import annotations
-import time
-from pathlib import Path
 import streamlit as st
 import pandas as pd
 import pydeck as pdk
-from geopy.geocoders import Nominatim
-from geopy.extra.rate_limiter import RateLimiter
+import random
 
-st.set_page_config(page_title="Halifax Non-Profits — Map (address-only OK)", layout="wide")
-st.title("Halifax Non-Profits — Map")
-st.caption("You can list only **address** (plus name & services). The app geocodes missing coordinates automatically (cached).")
+st.set_page_config(page_title="Halifax Non-Profits • Geographic Heatmaps", layout="wide")
+st.title("Halifax Non-Profits — Geographic Heatmaps")
 
-# -------------------------- Config -------------------------- #
-DATA_PATHS_XLSX = [Path("data/halifax_nonprofits_map.xlsx"), Path("halifax_nonprofits_map.xlsx")]
-DATA_PATHS_CSV  = [Path("data/nonprofits.csv"), Path("nonprofits.csv")]
-SHEET_NAME = "nonprofits"
+st.caption(
+    "Shows the concentration of **clients**, **volunteers**, or **program locations** on a map. "
+    "Use the built-in sample data or paste your own `lat,lon,weight` points (no files needed)."
+)
 
-HALIFAX_LAT_RANGE = (44.3, 45.1)
-HALIFAX_LON_RANGE = (-64.2, -62.9)
+# --------------------------- Helpers --------------------------- #
+def make_cluster(center_lat, center_lon, n=60, spread=0.01, w_low=1, w_high=5):
+    """Generate n points around (center_lat, center_lon) with Gaussian jitter."""
+    pts = []
+    for _ in range(n):
+        lat = random.gauss(center_lat, spread)
+        lon = random.gauss(center_lon, spread)
+        weight = random.randint(w_low, w_high)
+        pts.append({"lat": lat, "lon": lon, "weight": weight})
+    return pts
 
-CACHE_PATH = Path("data/geocode_cache.csv")  # optional on-disk cache (if repo is writeable at runtime)
+def sample_dataset(kind: str) -> pd.DataFrame:
+    """
+    Create small synthetic clusters around Halifax areas:
+    - North End / Gottingen
+    - Downtown / Waterfront
+    - Dartmouth
+    - Spryfield
+    - Clayton Park
+    """
+    random.seed(42 + hash(kind) % 1000)  # stable per kind
+    clusters = [
+        # (lat, lon, points, spread)
+        (44.6575, -63.5885, 70, 0.004),  # North End
+        (44.6450, -63.5720, 40, 0.0035), # Downtown
+        (44.6690, -63.5670, 30, 0.0030), # Hydrostone area
+        (44.6640, -63.5675, 35, 0.0030), # Agricola/Gottingen (reinforce)
+        (44.6660, -63.5695, 20, 0.0025), # Joseph Howe area
+        (44.6410, -63.6160, 35, 0.0045), # Clayton Park edge
+        (44.6030, -63.6200, 30, 0.0045), # Spryfield
+        (44.6655, -63.5690, 25, 0.0025), # Program cluster near North End
+        (44.6665, -63.5925, 25, 0.0035), # West of Gottingen
+        (44.6675, -63.5810, 25, 0.0030), # North of Cogswell
+    ]
+    pts = []
+    for (lat, lon, n, s) in clusters:
+        # vary strength by dataset type
+        if kind == "Clients":
+            w_low, w_high = 2, 6
+        elif kind == "Volunteers":
+            w_low, w_high = 1, 4
+        else:  # Program locations (treat as presence: heavier radius, medium weight)
+            w_low, w_high = 2, 5
+        pts.extend(make_cluster(lat, lon, n=n, spread=s, w_low=w_low, w_high=w_high))
+    return pd.DataFrame(pts)
 
-# ---------------------- Helpers ----------------------------- #
-def _normalize_columns(df: pd.DataFrame) -> pd.DataFrame:
-    df = df.copy()
-    df.columns = [c.strip().lower().replace(" ", "_") for c in df.columns]
-    alias = {
-        "organization": "org_name",
-        "org": "org_name",
-        "services_offered": "services",
-        "latitude": "lat",
-        "long": "lon",
-        "longitude": "lon",
-    }
-    df.rename(columns={c: alias.get(c, c) for c in df.columns], inplace=True)
-    for opt in ["website", "phone", "area", "notes"]:
-        if opt not in df.columns:
-            df[opt] = ""
-    # required
-    for col in ["org_name", "address", "services"]:
-        if col not in df.columns:
-            raise ValueError(f"Missing required column: {col}")
-    # coerce coords if present
-    if "lat" in df.columns: df["lat"] = pd.to_numeric(df["lat"], errors="coerce")
-    if "lon" in df.columns: df["lon"] = pd.to_numeric(df["lon"], errors="coerce")
-    return df
-
-@st.cache_data
-def _load_repo_data() -> tuple[pd.DataFrame | None, str]:
-    # Try Excel then CSV
-    for p in DATA_PATHS_XLSX:
-        if p.exists():
-            df = pd.read_excel(p, sheet_name=SHEET_NAME, engine="openpyxl")
-            return df, str(p)
-    for p in DATA_PATHS_CSV:
-        if p.exists():
-            df = pd.read_csv(p)
-            return df, str(p)
-    return None, ""
-
-@st.cache_data
-def _load_cache() -> pd.DataFrame:
-    if CACHE_PATH.exists():
+def parse_pasted(text: str) -> pd.DataFrame:
+    rows = []
+    for line in text.strip().splitlines():
+        if not line.strip():
+            continue
+        parts = [p.strip() for p in line.split(",")]
+        if len(parts) < 2:
+            continue
         try:
-            c = pd.read_csv(CACHE_PATH)
-            if not {"address","lat","lon"}.issubset({*c.columns}):
-                return pd.DataFrame(columns=["address","lat","lon"])
-            c["lat"] = pd.to_numeric(c["lat"], errors="coerce")
-            c["lon"] = pd.to_numeric(c["lon"], errors="coerce")
-            c["address_norm"] = c["address"].str.strip().str.lower()
-            return c
-        except Exception:
-            return pd.DataFrame(columns=["address","lat","lon"])
-    return pd.DataFrame(columns=["address","lat","lon"])
+            lat = float(parts[0])
+            lon = float(parts[1])
+            weight = float(parts[2]) if len(parts) >= 3 else 1.0
+            rows.append({"lat": lat, "lon": lon, "weight": weight})
+        except ValueError:
+            # skip malformed lines
+            continue
+    return pd.DataFrame(rows, columns=["lat", "lon", "weight"])
 
-def _save_cache(cache_df: pd.DataFrame):
-    # Best-effort; may fail on some hosts with read-only FS
-    try:
-        CACHE_PATH.parent.mkdir(parents=True, exist_ok=True)
-        cache_df.to_csv(CACHE_PATH, index=False)
-    except Exception:
-        pass
-
-def _norm_addr(s: str) -> str:
-    return (s or "").strip().lower()
-
-@st.cache_data(show_spinner=False)
-def _geocode_addresses(addresses: tuple[str, ...]) -> dict[str, tuple[float | None, float | None]]:
-    """
-    Geocode a tuple of addresses using Nominatim with rate limit.
-    Returns dict: normalized_address -> (lat, lon)
-    Results cached by Streamlit across reruns.
-    """
-    geocoder = Nominatim(user_agent="new_roots_halifax_map")
-    geocode = RateLimiter(geocoder.geocode, min_delay_seconds=1, swallow_exceptions=True)  # be polite!
-
-    results: dict[str, tuple[float | None, float | None]] = {}
-    for addr in addresses:
-        a = _norm_addr(addr)
-        loc = geocode(f"{addr}, Halifax, Nova Scotia, Canada")
-        if loc:
-            results[a] = (loc.latitude, loc.longitude)
-        else:
-            results[a] = (None, None)
-    return results
-
-def geocode_missing(df: pd.DataFrame, cache_df: pd.DataFrame) -> tuple[pd.DataFrame, list[str]]:
-    """Fill lat/lon for rows missing coords by geocoding address; merge with cache; return df and messages."""
-    msgs = []
-    # Prepare cache
-    cache = cache_df.copy()
-    if "address_norm" not in cache.columns:
-        cache["address_norm"] = cache["address"].astype(str).str.strip().str.lower()
-
-    df["address_norm"] = df["address"].astype(str).str.strip().str.lower()
-
-    # Use cached hits first
-    df = df.merge(cache[["address_norm","lat","lon"]].rename(columns={"lat":"lat_cached","lon":"lon_cached"}),
-                  on="address_norm", how="left")
-    df["lat"] = df.get("lat", pd.Series([None]*len(df)))
-    df["lon"] = df.get("lon", pd.Series([None]*len(df)))
-    df["lat"] = df["lat"].fillna(df["lat_cached"])
-    df["lon"] = df["lon"].fillna(df["lon_cached"])
-
-    # Collect addresses still missing
-    todo = df[df["lat"].isna() | df["lon"].isna()]["address"].dropna().unique().tolist()
-    if todo:
-        st.info(f"Geocoding {len(todo)} address(es)… (uses OpenStreetMap Nominatim; 1 req/sec)")
-        # Call geocoder (cached per unique address set)
-        lookups = _geocode_addresses(tuple(todo))
-        # Apply back
-        for addr in todo:
-            a = _norm_addr(addr)
-            lat, lon = lookups.get(a, (None, None))
-            if lat is not None and lon is not None:
-                df.loc[df["address_norm"] == a, "lat"] = lat
-                df.loc[df["address_norm"] == a, "lon"] = lon
-                # upsert to cache
-                cache_row = {"address": addr, "lat": lat, "lon": lon, "address_norm": a}
-                cache = pd.concat([cache[~(cache["address_norm"] == a)], pd.DataFrame([cache_row])], ignore_index=True)
-        _save_cache(cache)
-        msgs.append(f"Geocoded {sum([1 for a in todo if lookups.get(_norm_addr(a), (None, None))[0] is not None])} / {len(todo)} new address(es).")
-
-    # Clean up
-    df.drop(columns=[c for c in ["lat_cached","lon_cached","address_norm"] if c in df.columns], inplace=True)
-    return df, msgs
-
-def compute_view(df: pd.DataFrame) -> pdk.ViewState:
-    if df.empty or df["lat"].isna().all() or df["lon"].isna().all():
+def view_from_data(df: pd.DataFrame) -> pdk.ViewState:
+    if df.empty:
         return pdk.ViewState(latitude=44.6488, longitude=-63.5752, zoom=11, pitch=0)
     c_lat, c_lon = float(df["lat"].mean()), float(df["lon"].mean())
-    lat_span = (df["lat"].max() - df["lat"].min()) if not df["lat"].isna().all() else 0
-    lon_span = (df["lon"].max() - df["lon"].min()) if not df["lon"].isna().all() else 0
+    lat_span = df["lat"].max() - df["lat"].min()
+    lon_span = df["lon"].max() - df["lon"].min()
     span = max(abs(lat_span), abs(lon_span))
     if span > 0.5:   zoom = 9
     elif span > 0.2: zoom = 10
@@ -186,71 +101,79 @@ def compute_view(df: pd.DataFrame) -> pdk.ViewState:
     else:            zoom = 12
     return pdk.ViewState(latitude=c_lat, longitude=c_lon, zoom=zoom, pitch=0)
 
-def tooltip_template() -> dict:
-    return {
-        "html": (
-            "<b>{org_name}</b><br/>"
-            "{address}<br/>"
-            "<i>{services}</i><br/>"
-            "{phone}<br/>"
-            "<a href='{website}' target='_blank'>{website}</a>"
-        ),
-        "style": {"backgroundColor": "white", "color": "black"},
-    }
+# --------------------------- Controls ------------------------- #
+with st.sidebar:
+    st.header("Controls")
+    dataset_kind = st.selectbox("Dataset", ["Clients", "Volunteers", "Program locations"], index=0)
+    data_source = st.radio("Data source", ["Use sample", "Paste points"], horizontal=True)
+    radius_px = st.slider("Radius (pixels)", 10, 120, 60, 2)
+    intensity = st.slider("Intensity", 1.0, 5.0, 2.0, 0.1)
+    opacity = st.slider("Opacity", 0.2, 1.0, 0.85, 0.05)
+    threshold = st.slider("Threshold", 0.0, 1.0, 0.05, 0.01)
+    show_points = st.checkbox("Overlay point markers", value=False)
 
-# ---------------------- Load data ---------------------------- #
-raw, source = _load_repo_data()
-if raw is None:
-    st.error(
-        "No data file found.\n\n"
-        "Add **data/halifax_nonprofits_map.xlsx** (sheet: 'nonprofits') OR **data/nonprofits.csv** "
-        "to this repo (or use the root equivalents)."
-    )
-    st.stop()
+# ------------------------- Data prep -------------------------- #
+if data_source == "Use sample":
+    df = sample_dataset(dataset_kind)
+else:
+    st.subheader("Paste your points (lat,lon,weight)")
+    example = "44.6589,-63.5897,3\n44.6571,-63.5880,2\n44.6451,-63.5719,5"
+    pasted = st.text_area("One per line (no header):", value=example, height=120)
+    df = parse_pasted(pasted)
+    if df.empty:
+        st.warning("No valid rows parsed. Using a tiny fallback near North End.")
+        df = pd.DataFrame(
+            [{"lat": 44.6589, "lon": -63.5897, "weight": 3},
+             {"lat": 44.6571, "lon": -63.5880, "weight": 2}]
+        )
 
-try:
-    df = _normalize_columns(raw)
-except Exception as e:
-    st.error(str(e))
-    st.write("Detected columns:", list(raw.columns))
-    st.stop()
+# Ensure numeric
+df["lat"] = pd.to_numeric(df["lat"], errors="coerce")
+df["lon"] = pd.to_numeric(df["lon"], errors="coerce")
+df["weight"] = pd.to_numeric(df["weight"], errors="coerce").fillna(1.0)
+df = df.dropna(subset=["lat", "lon"]).copy()
 
-# Geocode if needed
-cache_df = _load_cache()
-df, geocode_msgs = geocode_missing(df, cache_df)
+st.success(f"Points: {len(df)}")
 
-# Keep only rows with coordinates after geocoding
-before = len(df)
-df = df.dropna(subset=["lat","lon"]).copy()
-after = len(df)
+with st.expander("Preview data"):
+    st.dataframe(df.head(20), use_container_width=True)
 
-st.success(f"Loaded from: **{source}** · Pins rendered: **{after}** (dropped {before - after} without coords)")
-for m in geocode_msgs:
-    st.info(m)
-
-# Bound warnings
-oob = (~df["lat"].between(*HALIFAX_LAT_RANGE) | ~df["lon"].between(*HALIFAX_LON_RANGE)).sum()
-if oob > 0:
-    st.warning(f"{oob} row(s) fall outside typical Halifax bounds. Check addresses or province.")
-
-with st.expander("Preview first 25 rows"):
-    st.dataframe(df.head(25), use_container_width=True)
-
-# ------------------------- Map ------------------------------- #
-view = compute_view(df)
-pins = pdk.Layer(
-    "ScatterplotLayer",
+# --------------------------- Map ------------------------------ #
+heat = pdk.Layer(
+    "HeatmapLayer",
     data=df,
     get_position='[lon, lat]',
-    get_radius=110,
-    pickable=True,
-    auto_highlight=True,
+    get_weight="weight",
+    radiusPixels=radius_px,
+    intensity=intensity,
+    threshold=threshold,
+    opacity=opacity,
 )
-deck = pdk.Deck(layers=[pins], initial_view_state=view, tooltip=tooltip_template())
+
+layers = [heat]
+
+if show_points:
+    pts = pdk.Layer(
+        "ScatterplotLayer",
+        data=df,
+        get_position='[lon, lat]',
+        get_radius=40,
+        pickable=False,
+        opacity=0.7,
+    )
+    layers.append(pts)
+
+deck = pdk.Deck(
+    layers=layers,
+    initial_view_state=view_from_data(df),
+    tooltip={"html": "<b>Weight:</b> {weight}", "style": {"backgroundColor": "white", "color": "black"}},
+    # default map style -> no Mapbox token required
+)
+
 st.pydeck_chart(deck, use_container_width=True)
 
 st.caption(
-    "To add organizations: edit your Excel/CSV (at the paths listed above). "
-    "You may leave `lat`/`lon` blank—addresses will be geocoded and cached automatically. "
-    "Powered by OpenStreetMap Nominatim (polite 1 req/sec)."
+    "Use **Radius** and **Intensity** to tune the heatmap. "
+    "Paste your own `lat,lon,weight` points to visualize where you have the most clients, volunteers, or program locations."
 )
+
