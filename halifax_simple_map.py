@@ -1,26 +1,97 @@
+# halifax_map_only.py
+# Minimal Streamlit app: map of Halifax with clickable pins for non-profits.
+# Edit the SAMPLE_DATA list or upload a CSV with columns:
+# org_name, address, services, lat, lon, website, phone
+#
+# Run:
+#   pip install streamlit pandas pydeck
+#   streamlit run halifax_map_only.py
+
 import streamlit as st
 import pandas as pd
+import pydeck as pdk
 
-st.set_page_config(page_title="Halifax Non‑Profits (Simple Map)", layout="wide")
-st.title("Halifax, Nova Scotia — Example Non‑Profits & Services (Simple Map)")
+st.set_page_config(page_title="Halifax Non-Profits — Map Only", layout="wide")
+st.title("Halifax Non-Profits — Map (Click pins for details)")
 
-st.write("Quick demo with a few **example** organizations. Edit the table to add your own.")
+# ---- 1) EDITABLE SAMPLE DATA -----------------------------------------------
+SAMPLE_DATA = [
+    {
+        "org_name": "Hope Blooms",
+        "address": "Barrington St, Halifax, NS",
+        "services": "Youth programs; community garden; food security",
+        "lat": 44.6585, "lon": -63.5918,
+        "website": "https://www.hopeblooms.ca", "phone": ""
+    },
+    {
+        "org_name": "North End Community Health Centre (NECHC)",
+        "address": "2165 Gottingen St, Halifax, NS",
+        "services": "Primary health care; community outreach; social supports",
+        "lat": 44.6577, "lon": -63.5887,
+        "website": "https://www.nechc.com", "phone": ""
+    },
+    {
+        "org_name": "Mi'kmaw Native Friendship Centre",
+        "address": "2021 Gottingen St, Halifax, NS B3K 3B1",
+        "services": "Indigenous cultural; housing & employment supports; youth",
+        "lat": 44.6597, "lon": -63.5823,
+        "website": "https://mymnfc.com", "phone": ""
+    },
+]
 
-# ---- Minimal example data (editable) ----
-data = pd.DataFrame([
-    {"org_name":"Hope Blooms","services":"Youth programs; community garden; food security","lat":44.6585,"lon":-63.5918},
-    {"org_name":"North End Community Health Centre (NECHC)","services":"Primary health care; community outreach; social supports","lat":44.6577,"lon":-63.5887},
-    {"org_name":"Mi'kmaw Native Friendship Centre","services":"Indigenous cultural; housing & employment supports; youth","lat":44.6597,"lon":-63.5823},
-    {"org_name":"Parker Street Food & Furniture Bank","services":"Food bank; furniture & household items; community supports","lat":44.6528,"lon":-63.5859},
-    {"org_name":"YWCA Halifax","services":"Women & family services; housing; employment; violence prevention","lat":44.6459,"lon":-63.5766},
-    {"org_name":"Halifax Refugee Clinic","services":"Legal aid for refugees; settlement support","lat":44.6479,"lon":-63.5799},
-    {"org_name":"YMCA Centre for Immigrant Programs","services":"Newcomer settlement; language; employment","lat":44.6425,"lon":-63.5756},
-])
+# ---- 2) OPTIONAL CSV UPLOAD -------------------------------------------------
+st.caption("Optional: Upload your own CSV (columns: org_name, address, services, lat, lon, website, phone).")
+uploaded = st.file_uploader("Upload CSV", type=["csv"])
 
-# Let users edit / add rows quickly
-edited = st.data_editor(data, num_rows="dynamic", use_container_width=True)
+if uploaded is not None:
+    df = pd.read_csv(uploaded)
+else:
+    df = pd.DataFrame(SAMPLE_DATA)
 
-st.subheader("Map")
-st.map(edited.rename(columns={"lat":"latitude","lon":"longitude"}), latitude="latitude", longitude="longitude", size=70)
+# ---- 3) BASIC VALIDATION ----------------------------------------------------
+required = ["org_name", "address", "services", "lat", "lon"]
+missing = [c for c in required if c not in df.columns]
+if missing:
+    st.error(f"Missing columns: {', '.join(missing)}")
+    st.stop()
 
-st.caption("Tip: Add more rows above and the map will update.")
+df = df.dropna(subset=["lat", "lon"]).copy()
+
+# ---- 4) MAP VIEW STATE (centered on Halifax) --------------------------------
+view = pdk.ViewState(latitude=44.6488, longitude=-63.5752, zoom=11, pitch=0)
+
+# ---- 5) TOOLTIP CONTENT (shown on hover/click) ------------------------------
+tooltip = {
+    "html": (
+        "<b>{org_name}</b><br/>"
+        "{address}<br/>"
+        "<i>{services}</i><br/>"
+        "{phone}<br/>"
+        "<a href='{website}' target='_blank'>{website}</a>"
+    ),
+    "style": {"backgroundColor": "white", "color": "black"}
+}
+
+# ---- 6) LAYER: clickable pins ----------------------------------------------
+layer = pdk.Layer(
+    "ScatterplotLayer",
+    data=df,
+    get_position='[lon, lat]',
+    get_radius=80,          # adjust pin size
+    pickable=True,
+    auto_highlight=True,
+)
+
+# ---- 7) RENDER --------------------------------------------------------------
+deck = pdk.Deck(
+    layers=[layer],
+    initial_view_state=view,
+    tooltip=tooltip,
+    # map_style left default to avoid requiring a Mapbox token explicitly
+)
+
+st.pydeck_chart(deck, use_container_width=True)
+
+# ---- 8) OPTIONAL: show data for quick edits (comment out if you want map-only)
+with st.expander("Show data table (optional)"):
+    st.dataframe(df, use_container_width=True)
