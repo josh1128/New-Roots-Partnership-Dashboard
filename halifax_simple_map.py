@@ -1,19 +1,6 @@
 # halifax_chamber_map_dots.py
-# Streamlit app: scrape Halifax Chamber Not-For-Profit directory, geocode, and show
-# BIG, VISIBLE DOTS on a Halifax map with tooltips.
-#
-# Run:
-#   pip install -r requirements.txt
-#   streamlit run halifax_chamber_map_dots.py
-#
-# requirements.txt (minimum):
-#   streamlit>=1.32
-#   pandas>=2.0
-#   pydeck>=0.9
-#   beautifulsoup4>=4.12
-#   lxml>=4.9
-#   requests>=2.32
-#   geopy>=2.4
+# Streamlit app: scrape Halifax Chamber Not-For-Profit directory, let users add their own Excel/CSV,
+# geocode (with cache), and show BIG, VISIBLE DOTS on a Halifax map with tooltips.
 
 from __future__ import annotations
 import re
@@ -39,8 +26,17 @@ CACHE_FILE = Path("data/geocode_cache.csv")  # persisted cache if filesystem is 
 HAL_LAT = (44.3, 45.1)
 HAL_LON = (-64.2, -62.9)
 
-# ------------------ Sidebar dot styling ------------------ #
+# ------------------ Sidebar controls ------------------ #
 with st.sidebar:
+    st.header("Your data")
+    st.caption("Upload an Excel (.xlsx) or CSV with columns like Name, Address, Description, Website, Phone.")
+    user_file = st.file_uploader("Upload nonprofits file", type=["xlsx", "xls", "csv"])
+    combine_mode = st.radio(
+        "How should uploaded data be used?",
+        ["Combine with Chamber directory", "Use uploaded only"],
+        index=0
+    )
+
     st.header("Dot style")
     radius_px = st.slider("Dot radius (pixels)", 40, 220, 120, 5)
     opacity_pct = st.slider("Opacity (%)", 20, 100, 90, 5)
@@ -149,6 +145,7 @@ def geocode_batch(addresses: tuple[str, ...]) -> dict[str, tuple[float | None, f
     geocode = RateLimiter(geocoder.geocode, min_delay_seconds=1, swallow_exceptions=True)
     results: dict[str, tuple[float | None, float | None]] = {}
     for addr in addresses:
+        # Bias search to HRM, but keep exact address text
         q = f"{addr}, Halifax Regional Municipality, Nova Scotia, Canada"
         loc = geocode(q)
         if loc:
@@ -159,21 +156,27 @@ def geocode_batch(addresses: tuple[str, ...]) -> dict[str, tuple[float | None, f
 
 def fill_coords(df: pd.DataFrame) -> tuple[pd.DataFrame, list[str]]:
     msgs = []
+    if df.empty:
+        return df, msgs
+
     cache = load_cache().copy()
     if "address_norm" not in cache.columns:
         cache["address_norm"] = cache["address"].astype(str).str.strip().str.lower()
 
+    # Ensure required cols exist
+    for c in ["address", "lat", "lon"]:
+        if c not in df.columns:
+            df[c] = None
+
     df["address_norm"] = df["address"].astype(str).str.strip().str.lower()
     df = df.merge(cache[["address_norm", "lat", "lon"]].rename(columns={"lat": "lat_cached", "lon": "lon_cached"}),
                   on="address_norm", how="left")
-    if "lat" not in df.columns: df["lat"] = None
-    if "lon" not in df.columns: df["lon"] = None
     df["lat"] = df["lat"].fillna(df["lat_cached"])
     df["lon"] = df["lon"].fillna(df["lon_cached"])
 
     todo = df[df["lat"].isna() | df["lon"].isna()]["address"].dropna().unique().tolist()
     if todo:
-        st.info(f"Geocoding {len(todo)} address(es)… (OpenStreetMap, 1 req/sec)")
+        st.info(f"Geocoding {len(todo)} address(es)… (OpenStreetMap, ~1 req/sec)")
         lookups = geocode_batch(tuple(todo))
         for addr in todo:
             lat, lon = lookups.get(addr, (None, None))
@@ -185,8 +188,10 @@ def fill_coords(df: pd.DataFrame) -> tuple[pd.DataFrame, list[str]]:
                     "lon": lon,
                     "address_norm": addr.strip().lower()
                 }
-                cache = pd.concat([cache[cache["address_norm"] != row["address_norm"]], pd.DataFrame([row])],
-                                  ignore_index=True)
+                cache = pd.concat(
+                    [cache[cache["address_norm"] != row["address_norm"]], pd.DataFrame([row])],
+                    ignore_index=True
+                )
         save_cache(cache)
         good = sum(1 for a in todo if lookups.get(a, (None, None))[0] is not None)
         msgs.append(f"Geocoded {good}/{len(todo)} new address(es).")
@@ -194,7 +199,7 @@ def fill_coords(df: pd.DataFrame) -> tuple[pd.DataFrame, list[str]]:
     df.drop(columns=[c for c in ["lat_cached", "lon_cached", "address_norm"] if c in df.columns], inplace=True)
     return df, msgs
 
-# ------------------ Build dataset ------------------ #
+# ------------------ Build Chamber dataset ------------------ #
 @st.cache_data
 def build_directory_dataframe(url: str) -> pd.DataFrame:
     listing = parse_listing_page(url)
@@ -225,26 +230,112 @@ def build_directory_dataframe(url: str) -> pd.DataFrame:
     df["area"] = df["address"].apply(infer_area)
     return df
 
-with st.spinner("Fetching Halifax Chamber directory…"):
-    df = build_directory_dataframe(CATEGORY_URL)
+# ------------------ User-upload helpers ------------------ #
+COLUMN_MAP = {
+    "name": "org_name",
+    "organization": "org_name",
+    "org": "org_name",
+    "org_name": "org_name",
+    "address": "address",
+    "description": "about",
+    "about": "about",
+    "summary": "about",
+    "website": "website",
+    "url": "website",
+    "phone": "phone",
+    "telephone": "phone",
+}
 
-keep = ["org_name", "area", "address", "website", "phone", "about", "detail_url"]
-df = df[keep].copy()
-df, geocode_msgs = fill_coords(df)
+def normalize_user_df(raw: pd.DataFrame) -> pd.DataFrame:
+    # lowercase & trim headers
+    df = raw.copy()
+    rename = {}
+    for c in df.columns:
+        key = str(c).strip().lower()
+        if key in COLUMN_MAP:
+            rename[c] = COLUMN_MAP[key]
+    if rename:
+        df = df.rename(columns=rename)
+
+    # keep only known columns; create missing ones
+    keep = ["org_name", "address", "website", "phone", "about"]
+    for k in keep:
+        if k not in df.columns:
+            df[k] = ""
+    df = df[keep].copy()
+
+    # basic cleanup
+    df["org_name"] = df["org_name"].astype(str).str.strip()
+    df["address"] = df["address"].astype(str).str.strip()
+    df["website"] = df["website"].astype(str).str.strip()
+    df["phone"] = df["phone"].astype(str).str.strip()
+    df["about"] = df["about"].astype(str).str.strip()
+    df["detail_url"] = ""  # placeholder to match Chamber schema
+
+    # simple area inference
+    def infer_area(addr: str) -> str:
+        a = (addr or "").lower()
+        if "dartmouth" in a: return "Dartmouth"
+        if "bedford" in a: return "Bedford"
+        if "halifax" in a: return "Halifax"
+        return "HRM"
+    df["area"] = df["address"].apply(infer_area)
+    return df
+
+def read_user_file(f) -> pd.DataFrame:
+    try:
+        if f.name.lower().endswith(".csv"):
+            raw = pd.read_csv(f)
+        else:
+            raw = pd.read_excel(f)
+        return normalize_user_df(raw)
+    except Exception as e:
+        st.error(f"Could not read file: {e}")
+        return pd.DataFrame(columns=["org_name", "area", "address", "website", "phone", "about", "detail_url"])
+
+# ------------------ Build the combined dataset ------------------ #
+with st.spinner("Fetching Halifax Chamber directory…"):
+    chamber_df = build_directory_dataframe(CATEGORY_URL)
+
+# Ensure consistent columns for Chamber df
+keep_cols = ["org_name", "area", "address", "website", "phone", "about", "detail_url"]
+chamber_df = chamber_df.reindex(columns=keep_cols).fillna("")
+
+user_df = pd.DataFrame(columns=keep_cols)
+if user_file is not None:
+    user_df = read_user_file(user_file)
+
+# Choose base dataframe
+if user_file is not None and combine_mode == "Use uploaded only":
+    base_df = user_df.copy()
+else:
+    # Combine (uploaded first so it can override by name/address on merge if needed)
+    base_df = pd.concat([user_df, chamber_df], ignore_index=True)
+
+# De-duplicate by (org_name, address) where available
+if not base_df.empty:
+    base_df["org_key"] = (
+        base_df["org_name"].astype(str).str.strip().str.lower() + " | " +
+        base_df["address"].astype(str).str.strip().str.lower()
+    )
+    base_df = base_df.drop_duplicates(subset=["org_key"]).drop(columns=["org_key"])
+
+# Geocode
+base_df, geocode_msgs = fill_coords(base_df)
 
 # sanity: outside Halifax bounds
-oob = (~df["lat"].between(*HAL_LAT) | ~df["lon"].between(*HAL_LON))
-oob_count = int(oob.sum())
-pins = df.dropna(subset=["lat", "lon"]).copy()
+oob = (~base_df["lat"].between(*HAL_LAT) | ~base_df["lon"].between(*HAL_LON))
+oob_count = int(oob.fillna(False).sum())
+pins = base_df.dropna(subset=["lat", "lon"]).copy()
 
-st.success(f"Loaded nonprofits: {len(df)} · Mappable dots: {len(pins)}")
+st.success(f"Loaded nonprofits: {len(base_df)} · Mappable dots: {len(pins)}")
 for m in geocode_msgs:
     st.info(m)
 if oob_count:
     st.warning(f"{oob_count} location(s) outside typical Halifax bounds (may be PO boxes / province-wide).")
 
 with st.expander("Preview data"):
-    st.dataframe(df.sort_values("org_name").reset_index(drop=True), use_container_width=True)
+    st.dataframe(base_df.sort_values("org_name").reset_index(drop=True), use_container_width=True)
 
 # ------------------ Map (visible dots) ------------------ #
 def compute_view(d: pd.DataFrame) -> pdk.ViewState:
@@ -263,7 +354,7 @@ tooltip = {
     "style": {"backgroundColor": "white", "color": "black"},
 }
 
-dot_color = [RGB[0], RGB[1], RGB[2], ALPHA]
+dot_color = [*COLOR_MAP[color_name], int(round(opacity_pct / 100 * 255))]
 
 dots = pdk.Layer(
     "ScatterplotLayer",
@@ -280,5 +371,6 @@ dots = pdk.Layer(
 deck = pdk.Deck(layers=[dots], initial_view_state=compute_view(pins), tooltip=tooltip)
 st.pydeck_chart(deck, use_container_width=True)
 
-st.caption("Dots are sized for visibility. Adjust size/opacity/color in the sidebar.")
+st.caption("Upload your nonprofits file in the sidebar. Dots are sized for visibility; tweak size/opacity/color there.")
+
 
