@@ -1,8 +1,30 @@
 # halifax_chamber_map_dots.py
-# Streamlit app: scrape Halifax Chamber Not-For-Profit directory, let users add their own Excel/CSV,
-# geocode (with cache), and show BIG, VISIBLE DOTS on a Halifax map with tooltips.
+# Streamlit app: scrape Halifax Chamber Not-For-Profit directory, geocode, and show
+# BIG, VISIBLE DOTS on a Halifax map with tooltips.
+#
+# New:
+# - Download current nonprofits as Excel
+# - Download a blank Excel template
+# - Upload an Excel (template or previously downloaded) to add/edit nonprofits
+#   → Newly added rows are geocoded and appear on the map
+#
+# Run:
+#   pip install -r requirements.txt
+#   streamlit run halifax_chamber_map_dots.py
+#
+# requirements.txt (minimum):
+#   streamlit>=1.32
+#   pandas>=2.0
+#   pydeck>=0.9
+#   beautifulsoup4>=4.12
+#   lxml>=4.9
+#   requests>=2.32
+#   geopy>=2.4
+#   openpyxl>=3.1
 
 from __future__ import annotations
+
+import io
 import re
 import time
 from pathlib import Path
@@ -26,17 +48,8 @@ CACHE_FILE = Path("data/geocode_cache.csv")  # persisted cache if filesystem is 
 HAL_LAT = (44.3, 45.1)
 HAL_LON = (-64.2, -62.9)
 
-# ------------------ Sidebar controls ------------------ #
+# ------------------ Sidebar dot styling ------------------ #
 with st.sidebar:
-    st.header("Your data")
-    st.caption("Upload an Excel (.xlsx) or CSV with columns like Name, Address, Description, Website, Phone.")
-    user_file = st.file_uploader("Upload nonprofits file", type=["xlsx", "xls", "csv"])
-    combine_mode = st.radio(
-        "How should uploaded data be used?",
-        ["Combine with Chamber directory", "Use uploaded only"],
-        index=0
-    )
-
     st.header("Dot style")
     radius_px = st.slider("Dot radius (pixels)", 40, 220, 120, 5)
     opacity_pct = st.slider("Opacity (%)", 20, 100, 90, 5)
@@ -56,11 +69,13 @@ COLOR_MAP = {
 RGB = COLOR_MAP[color_name]
 ALPHA = int(round(opacity_pct / 100 * 255))
 
+
 # ------------------ Scrape helpers ------------------ #
 def get_soup(url: str) -> BeautifulSoup:
     resp = requests.get(url, timeout=30)
     resp.raise_for_status()
     return BeautifulSoup(resp.text, "lxml")
+
 
 def parse_listing_page(url: str) -> list[dict]:
     """Return list of {name, detail_url} from the category page."""
@@ -81,8 +96,10 @@ def parse_listing_page(url: str) -> list[dict]:
         uniq.append(it)
     return uniq
 
+
 def txt(el) -> str:
     return el.get_text(" ", strip=True) if el else ""
+
 
 def parse_member_detail(url: str) -> dict:
     """Grab org_name, address, website, phone, about from a member page."""
@@ -117,7 +134,15 @@ def parse_member_detail(url: str) -> dict:
         nxt = about_hdr.find_next()
         about = txt(nxt)
 
-    return {"org_name": name, "address": addr, "website": website, "phone": phone, "about": about, "detail_url": url}
+    return {
+        "org_name": name,
+        "address": addr,
+        "website": website,
+        "phone": phone,
+        "about": about,
+        "detail_url": url,
+    }
+
 
 # ------------------ Geocoding (cached) ------------------ #
 @st.cache_data
@@ -132,6 +157,7 @@ def load_cache() -> pd.DataFrame:
             pass
     return pd.DataFrame(columns=["address", "lat", "lon", "address_norm"])
 
+
 def save_cache(cache_df: pd.DataFrame):
     try:
         CACHE_FILE.parent.mkdir(parents=True, exist_ok=True)
@@ -139,13 +165,17 @@ def save_cache(cache_df: pd.DataFrame):
     except Exception:
         pass
 
+
 @st.cache_data(show_spinner=False)
 def geocode_batch(addresses: tuple[str, ...]) -> dict[str, tuple[float | None, float | None]]:
     geocoder = Nominatim(user_agent="halifax_nonprofits_map_dots")
     geocode = RateLimiter(geocoder.geocode, min_delay_seconds=1, swallow_exceptions=True)
+
     results: dict[str, tuple[float | None, float | None]] = {}
     for addr in addresses:
-        # Bias search to HRM, but keep exact address text
+        if not isinstance(addr, str) or not addr.strip():
+            results[addr] = (None, None)
+            continue
         q = f"{addr}, Halifax Regional Municipality, Nova Scotia, Canada"
         loc = geocode(q)
         if loc:
@@ -154,23 +184,27 @@ def geocode_batch(addresses: tuple[str, ...]) -> dict[str, tuple[float | None, f
             results[addr] = (None, None)
     return results
 
+
 def fill_coords(df: pd.DataFrame) -> tuple[pd.DataFrame, list[str]]:
     msgs = []
-    if df.empty:
-        return df, msgs
-
     cache = load_cache().copy()
     if "address_norm" not in cache.columns:
         cache["address_norm"] = cache["address"].astype(str).str.strip().str.lower()
 
-    # Ensure required cols exist
-    for c in ["address", "lat", "lon"]:
-        if c not in df.columns:
-            df[c] = None
-
+    df["address"] = df["address"].fillna("").astype(str)
     df["address_norm"] = df["address"].astype(str).str.strip().str.lower()
-    df = df.merge(cache[["address_norm", "lat", "lon"]].rename(columns={"lat": "lat_cached", "lon": "lon_cached"}),
-                  on="address_norm", how="left")
+
+    df = df.merge(
+        cache[["address_norm", "lat", "lon"]].rename(columns={"lat": "lat_cached", "lon": "lon_cached"}),
+        on="address_norm",
+        how="left",
+    )
+
+    if "lat" not in df.columns:
+        df["lat"] = None
+    if "lon" not in df.columns:
+        df["lon"] = None
+
     df["lat"] = df["lat"].fillna(df["lat_cached"])
     df["lon"] = df["lon"].fillna(df["lon_cached"])
 
@@ -186,11 +220,11 @@ def fill_coords(df: pd.DataFrame) -> tuple[pd.DataFrame, list[str]]:
                     "address": addr,
                     "lat": lat,
                     "lon": lon,
-                    "address_norm": addr.strip().lower()
+                    "address_norm": addr.strip().lower(),
                 }
                 cache = pd.concat(
                     [cache[cache["address_norm"] != row["address_norm"]], pd.DataFrame([row])],
-                    ignore_index=True
+                    ignore_index=True,
                 )
         save_cache(cache)
         good = sum(1 for a in todo if lookups.get(a, (None, None))[0] is not None)
@@ -199,11 +233,12 @@ def fill_coords(df: pd.DataFrame) -> tuple[pd.DataFrame, list[str]]:
     df.drop(columns=[c for c in ["lat_cached", "lon_cached", "address_norm"] if c in df.columns], inplace=True)
     return df, msgs
 
-# ------------------ Build Chamber dataset ------------------ #
+
+# ------------------ Build dataset (scraped) ------------------ #
 @st.cache_data
 def build_directory_dataframe(url: str) -> pd.DataFrame:
     listing = parse_listing_page(url)
-    # visit each detail page
+
     rows = []
     seen = set()
     for i, item in enumerate(listing, 1):
@@ -217,131 +252,167 @@ def build_directory_dataframe(url: str) -> pd.DataFrame:
                 detail["org_name"] = item["name"]
             rows.append(detail)
         except Exception as e:
-            rows.append({"org_name": item["name"], "address": "", "website": "", "phone": "", "about": "", "detail_url": href, "error": str(e)})
-        time.sleep(0.2)  # be polite to the site
+            rows.append(
+                {
+                    "org_name": item["name"],
+                    "address": "",
+                    "website": "",
+                    "phone": "",
+                    "about": "",
+                    "detail_url": href,
+                    "error": str(e),
+                }
+            )
+        time.sleep(0.2)  # be polite
+
     df = pd.DataFrame(rows)
+
     # naive area from address
     def infer_area(addr: str) -> str:
         a = (addr or "").lower()
-        if "dartmouth" in a: return "Dartmouth"
-        if "bedford" in a: return "Bedford"
-        if "halifax" in a: return "Halifax"
+        if "dartmouth" in a:
+            return "Dartmouth"
+        if "bedford" in a:
+            return "Bedford"
+        if "halifax" in a:
+            return "Halifax"
         return "HRM"
+
     df["area"] = df["address"].apply(infer_area)
     return df
 
-# ------------------ User-upload helpers ------------------ #
-COLUMN_MAP = {
-    "name": "org_name",
-    "organization": "org_name",
-    "org": "org_name",
-    "org_name": "org_name",
-    "address": "address",
-    "description": "about",
-    "about": "about",
-    "summary": "about",
-    "website": "website",
-    "url": "website",
-    "phone": "phone",
-    "telephone": "phone",
-}
 
-def normalize_user_df(raw: pd.DataFrame) -> pd.DataFrame:
-    # lowercase & trim headers
-    df = raw.copy()
-    rename = {}
-    for c in df.columns:
-        key = str(c).strip().lower()
-        if key in COLUMN_MAP:
-            rename[c] = COLUMN_MAP[key]
-    if rename:
-        df = df.rename(columns=rename)
+# ------------------ Excel helpers (NEW) ------------------ #
+REQUIRED_COLUMNS = ["org_name", "address", "website", "phone", "about"]
+OPTIONAL_COLUMNS = ["area", "detail_url", "lat", "lon"]
 
-    # keep only known columns; create missing ones
-    keep = ["org_name", "address", "website", "phone", "about"]
-    for k in keep:
-        if k not in df.columns:
-            df[k] = ""
-    df = df[keep].copy()
+def make_template_df() -> pd.DataFrame:
+    # Provide empty template with required + optional columns (lat/lon optional)
+    cols = REQUIRED_COLUMNS + OPTIONAL_COLUMNS
+    return pd.DataFrame(columns=cols)
 
-    # basic cleanup
-    df["org_name"] = df["org_name"].astype(str).str.strip()
-    df["address"] = df["address"].astype(str).str.strip()
-    df["website"] = df["website"].astype(str).str.strip()
-    df["phone"] = df["phone"].astype(str).str.strip()
-    df["about"] = df["about"].astype(str).str.strip()
-    df["detail_url"] = ""  # placeholder to match Chamber schema
+def to_excel_bytes(df: pd.DataFrame, sheet_name: str = "nonprofits") -> bytes:
+    output = io.BytesIO()
+    with pd.ExcelWriter(output, engine="openpyxl") as writer:
+        df.to_excel(writer, index=False, sheet_name=sheet_name)
+    return output.getvalue()
 
-    # simple area inference
-    def infer_area(addr: str) -> str:
-        a = (addr or "").lower()
-        if "dartmouth" in a: return "Dartmouth"
-        if "bedford" in a: return "Bedford"
-        if "halifax" in a: return "Halifax"
-        return "HRM"
-    df["area"] = df["address"].apply(infer_area)
-    return df
+def normalize_columns(df: pd.DataFrame) -> pd.DataFrame:
+    # Make sure expected columns exist; fill missing optional ones
+    for c in REQUIRED_COLUMNS:
+        if c not in df.columns:
+            df[c] = ""
+    for c in OPTIONAL_COLUMNS:
+        if c not in df.columns:
+            df[c] = ""
+    # keep a consistent column order
+    return df[REQUIRED_COLUMNS + OPTIONAL_COLUMNS].copy()
 
-def read_user_file(f) -> pd.DataFrame:
-    try:
-        if f.name.lower().endswith(".csv"):
-            raw = pd.read_csv(f)
-        else:
-            raw = pd.read_excel(f)
-        return normalize_user_df(raw)
-    except Exception as e:
-        st.error(f"Could not read file: {e}")
-        return pd.DataFrame(columns=["org_name", "area", "address", "website", "phone", "about", "detail_url"])
+def merge_uploaded(scraped: pd.DataFrame, uploaded: pd.DataFrame) -> pd.DataFrame:
+    """
+    Merge strategy:
+    - Key is (org_name, address) case-insensitive trim
+    - Uploaded rows override scraped on conflicts
+    - Include rows unique to either side
+    """
+    a = scraped.copy()
+    b = uploaded.copy()
+    for d in (a, b):
+        d["__key"] = (
+            d["org_name"].astype(str).str.strip().str.lower()
+            + " | "
+            + d["address"].astype(str).str.strip().str.lower()
+        )
 
-# ------------------ Build the combined dataset ------------------ #
+    # Keep uploaded first to override, then add scraped that aren't in uploaded
+    combined = pd.concat([b, a[~a["__key"].isin(b["__key"])]], ignore_index=True)
+    combined.drop(columns=["__key"], inplace=True, errors="ignore")
+    return combined
+
+
+# ------------------ Main flow ------------------ #
 with st.spinner("Fetching Halifax Chamber directory…"):
-    chamber_df = build_directory_dataframe(CATEGORY_URL)
+    df_scraped = build_directory_dataframe(CATEGORY_URL)
 
-# Ensure consistent columns for Chamber df
-keep_cols = ["org_name", "area", "address", "website", "phone", "about", "detail_url"]
-chamber_df = chamber_df.reindex(columns=keep_cols).fillna("")
+keep = ["org_name", "area", "address", "website", "phone", "about", "detail_url"]
+df_scraped = df_scraped[keep].copy()
 
-user_df = pd.DataFrame(columns=keep_cols)
-if user_file is not None:
-    user_df = read_user_file(user_file)
+# Upload Excel to add/edit nonprofits (NEW)
+st.subheader("Add or edit nonprofits via Excel (optional)")
+st.markdown(
+    "Upload an **Excel file** with columns: "
+    "`org_name`, `address`, `website`, `phone`, `about` "
+    "(optional: `area`, `detail_url`, `lat`, `lon`). "
+    "If `lat`/`lon` are missing, the app will geocode from `address`."
+)
 
-# Choose base dataframe
-if user_file is not None and combine_mode == "Use uploaded only":
-    base_df = user_df.copy()
-else:
-    # Combine (uploaded first so it can override by name/address on merge if needed)
-    base_df = pd.concat([user_df, chamber_df], ignore_index=True)
-
-# De-duplicate by (org_name, address) where available
-if not base_df.empty:
-    base_df["org_key"] = (
-        base_df["org_name"].astype(str).str.strip().str.lower() + " | " +
-        base_df["address"].astype(str).str.strip().str.lower()
+c1, c2, c3 = st.columns([1,1,2])
+with c1:
+    template_bytes = to_excel_bytes(make_template_df())
+    st.download_button(
+        "Download blank Excel template",
+        data=template_bytes,
+        file_name="nonprofits_template.xlsx",
+        mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+        use_container_width=True,
     )
-    base_df = base_df.drop_duplicates(subset=["org_key"]).drop(columns=["org_key"])
+with c2:
+    # Also offer the scraped dataset for editing
+    scraped_bytes = to_excel_bytes(normalize_columns(df_scraped))
+    st.download_button(
+        "Download current nonprofits (Excel)",
+        data=scraped_bytes,
+        file_name="nonprofits_current.xlsx",
+        mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+        use_container_width=True,
+    )
 
-# Geocode
-base_df, geocode_msgs = fill_coords(base_df)
+uploaded_df = None
+uploaded_file = st.file_uploader("Upload Excel (.xlsx) to add/edit nonprofits", type=["xlsx"])
+if uploaded_file is not None:
+    try:
+        df_up = pd.read_excel(uploaded_file, engine="openpyxl")
+        uploaded_df = normalize_columns(df_up)
+        st.success(f"Uploaded rows: {len(uploaded_df)}")
+        with st.expander("Preview uploaded data"):
+            st.dataframe(uploaded_df, use_container_width=True)
+    except Exception as e:
+        st.error(f"Could not read Excel: {e}")
 
-# sanity: outside Halifax bounds
-oob = (~base_df["lat"].between(*HAL_LAT) | ~base_df["lon"].between(*HAL_LON))
-oob_count = int(oob.fillna(False).sum())
-pins = base_df.dropna(subset=["lat", "lon"]).copy()
+# Merge scraped + uploaded (uploaded overrides on key)
+if uploaded_df is not None and not uploaded_df.empty:
+    df_combined = merge_uploaded(df_scraped, uploaded_df)
+else:
+    df_combined = df_scraped.copy()
 
-st.success(f"Loaded nonprofits: {len(base_df)} · Mappable dots: {len(pins)}")
+# Geocode missing coords and prep for map
+df_combined, geocode_msgs = fill_coords(df_combined)
+
+# Sanity: outside Halifax bounds
+oob = (~df_combined["lat"].between(*HAL_LAT) | ~df_combined["lon"].between(*HAL_LON))
+oob_count = int(oob.sum())
+
+pins = df_combined.dropna(subset=["lat", "lon"]).copy()
+
+st.success(f"Loaded nonprofits: {len(df_combined)} · Mappable dots: {len(pins)}")
 for m in geocode_msgs:
     st.info(m)
 if oob_count:
     st.warning(f"{oob_count} location(s) outside typical Halifax bounds (may be PO boxes / province-wide).")
 
 with st.expander("Preview data"):
-    st.dataframe(base_df.sort_values("org_name").reset_index(drop=True), use_container_width=True)
+    st.dataframe(df_combined.sort_values("org_name").reset_index(drop=True), use_container_width=True)
 
 # ------------------ Map (visible dots) ------------------ #
 def compute_view(d: pd.DataFrame) -> pdk.ViewState:
     if d.empty:
         return pdk.ViewState(latitude=44.6488, longitude=-63.5752, zoom=11, pitch=0)
-    return pdk.ViewState(latitude=float(d["lat"].mean()), longitude=float(d["lon"].mean()), zoom=11, pitch=0)
+    return pdk.ViewState(
+        latitude=float(d["lat"].mean()),
+        longitude=float(d["lon"].mean()),
+        zoom=11,
+        pitch=0,
+    )
 
 tooltip = {
     "html": (
@@ -354,23 +425,32 @@ tooltip = {
     "style": {"backgroundColor": "white", "color": "black"},
 }
 
-dot_color = [*COLOR_MAP[color_name], int(round(opacity_pct / 100 * 255))]
-
+dot_color = [RGB[0], RGB[1], RGB[2], ALPHA]
 dots = pdk.Layer(
     "ScatterplotLayer",
     data=pins,
     get_position='[lon, lat]',
-    get_radius=radius_px,       # BIG, visible dots
+    get_radius=radius_px,  # BIG, visible dots
     filled=True,
-    stroked=False,              # no thin outlines
-    get_fill_color=dot_color,   # constant color with chosen opacity
+    stroked=False,  # no thin outlines
+    get_fill_color=dot_color,  # constant color with chosen opacity
     pickable=True,
     auto_highlight=True,
 )
 
 deck = pdk.Deck(layers=[dots], initial_view_state=compute_view(pins), tooltip=tooltip)
 st.pydeck_chart(deck, use_container_width=True)
+st.caption("Dots are sized for visibility. Adjust size/opacity/color in the sidebar.")
 
-st.caption("Upload your nonprofits file in the sidebar. Dots are sized for visibility; tweak size/opacity/color there.")
+# ------------------ Download the current combined dataset (NEW) ------------------ #
+st.subheader("Export")
+st.markdown("Download everything currently on the map (scraped + uploaded edits).")
+combined_bytes = to_excel_bytes(normalize_columns(df_combined))
+st.download_button(
+    "Download combined nonprofits (Excel)",
+    data=combined_bytes,
+    file_name="nonprofits_combined.xlsx",
+    mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+)
 
 
